@@ -1,6 +1,8 @@
 # Ignore CSV files
 *.csv
 
+# Ignore xml files
+*.xml
 # Ignore Python cache
 __pycache__/
 *.pyc
