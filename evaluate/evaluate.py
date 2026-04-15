@@ -1,46 +1,58 @@
-import os
-import json
-import time
+import os, json, time
 from dotenv import load_dotenv
+from neo4j import GraphDatabase
 from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
 
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0,
-    api_key=os.getenv("GROQ_API_KEY"),
-)
+NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
+NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
+
+llm = ChatGroq(model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0,
+               api_key=os.getenv("GROQ_API_KEY"))
 
 EVAL_PROMPT = PromptTemplate.from_template("""
-You are evaluating a medical QA system. Score the generated answer vs the reference answer.
+You are evaluating a medical QA system.
 
-Question       : {question}
-Reference answer: {reference}
+Question        : {question}
 Generated answer: {generated}
 
-Score on these 3 criteria (each 0.0 to 1.0):
-1. Faithfulness  : Is the generated answer factually consistent with the reference?
-2. Relevance     : Does it directly answer the question?
-3. Completeness  : Does it cover the key points from the reference?
+Score on 3 criteria (each 0.0 to 1.0):
+1. Faithfulness  : Is the answer factually plausible for the question?
+2. Relevance     : Does it directly address the question?
+3. Completeness  : Is the answer sufficiently detailed?
 
-Output JSON only, no explanation:
+Output JSON only:
 {{"faithfulness": 0.0, "relevance": 0.0, "completeness": 0.0}}
 """)
 
 eval_chain = EVAL_PROMPT | llm | StrOutputParser()
 
 
-def evaluate_single(question: str, reference: str, generated: str) -> dict:
-    raw = eval_chain.invoke({
-        "question":  question,
-        "reference": reference,
-        "generated": generated,
-    })
+def get_questions_from_kg(dataset_tag: str, limit: int = 10) -> list[str]:
+    """Pull questions stored during KG construction for a specific dataset."""
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
-        # Strip markdown fences if present
+        with driver.session() as session:
+            result = session.run("""
+                MATCH (q:Question {dataset: $tag})
+                RETURN q.text AS text
+                LIMIT $limit
+            """, tag=dataset_tag, limit=limit)
+            questions = [r["text"] for r in result]
+    finally:
+        driver.close()
+
+    print(f"  [eval] Loaded {len(questions)} questions for dataset='{dataset_tag}'")
+    return questions
+
+
+def evaluate_single(question: str, generated: str) -> dict:
+    try:
+        raw = eval_chain.invoke({"question": question, "generated": generated})
         clean = raw.strip().replace("```json", "").replace("```", "").strip()
         scores = json.loads(clean)
         scores["overall"] = round(
@@ -48,82 +60,57 @@ def evaluate_single(question: str, reference: str, generated: str) -> dict:
         )
         return scores
     except Exception as e:
-        print(f"  [eval] JSON parse error: {e} | raw: {raw}")
+        print(f"  [eval] Error: {e}")
         return {"faithfulness": 0, "relevance": 0, "completeness": 0, "overall": 0}
 
 
-def evaluate_dataset(qa_pairs: list[dict], pipeline_fn) -> dict:
+def evaluate_dataset(dataset_tag: str, pipeline_fn, limit: int = 10) -> dict:
     """
-    Input  : list of {"question": ..., "answer": ...} dicts (ground truth)
-             pipeline_fn — callable that takes question → generated answer string
-    Output : aggregate scores dict
+    Pulls questions from Neo4j by dataset tag, runs pipeline, scores answers.
+    """
+    questions = get_questions_from_kg(dataset_tag, limit=limit)
+    if not questions:
+        print(f"  [eval] No questions found for tag='{dataset_tag}'. Run construction.py first.")
+        return {}
 
-    Example qa_pairs entry:
-        {"question": "What are symptoms of diabetes?", "answer": "Fatigue, frequent urination..."}
-    """
     all_scores = []
-
-    for i, item in enumerate(qa_pairs):
-        question  = item["question"]
-        reference = item["answer"]
-
-        print(f"\n[{i+1}/{len(qa_pairs)}] {question[:60]}...")
-
+    for i, question in enumerate(questions):
+        print(f"\n[{i+1}/{len(questions)}] {question[:70]}...")
         try:
             generated = pipeline_fn(question)
         except Exception as e:
-            print(f"  [eval] Pipeline error: {e}")
+            print(f"  [pipeline error] {e}")
             generated = ""
 
-        scores = evaluate_single(question, reference, generated)
+        scores = evaluate_single(question, generated)
         scores["question"] = question
         all_scores.append(scores)
+        print(f"  F={scores['faithfulness']} R={scores['relevance']} C={scores['completeness']} Overall={scores['overall']}")
+        time.sleep(3)  # rate limit guard
 
-        print(f"  Faithfulness={scores['faithfulness']} | "
-              f"Relevance={scores['relevance']} | "
-              f"Completeness={scores['completeness']} | "
-              f"Overall={scores['overall']}")
-
-        # Rate limit guard
-        time.sleep(3)
-
-    # Aggregate
     n = len(all_scores)
     agg = {
+        "dataset":       dataset_tag,
+        "n":             n,
         "faithfulness":  round(sum(s["faithfulness"]  for s in all_scores) / n, 4),
         "relevance":     round(sum(s["relevance"]     for s in all_scores) / n, 4),
         "completeness":  round(sum(s["completeness"]  for s in all_scores) / n, 4),
         "overall":       round(sum(s["overall"]       for s in all_scores) / n, 4),
-        "n":             n,
     }
 
     print(f"\n{'='*50}")
-    print(f"EVAL RESULTS (n={n})")
+    print(f"RESULTS — {dataset_tag} (n={n})")
     print(f"  Faithfulness : {agg['faithfulness']}")
     print(f"  Relevance    : {agg['relevance']}")
     print(f"  Completeness : {agg['completeness']}")
     print(f"  Overall      : {agg['overall']}")
     print(f"{'='*50}")
-
     return agg
 
 
 if __name__ == "__main__":
-    # Quick smoke test with fake data
     from pipeline import run_pipeline
 
-    TEST_QA = [
-        {
-            "question": "What are the symptoms and treatments for diabetes?",
-            "answer": "Diabetes symptoms include fatigue, frequent urination, blurred vision. "
-                      "Treatment includes insulin therapy and blood glucose monitoring."
-        },
-        {
-            "question": "What medications are used for hypertension?",
-            "answer": "Common medications for hypertension include ACE inhibitors, beta blockers, "
-                      "and calcium channel blockers."
-        },
-    ]
-
-    results = evaluate_dataset(TEST_QA, run_pipeline)
-    print(json.dumps(results, indent=2))
+    # Evaluate separately per dataset — shows results for each DB
+    for tag in ["MTS-Dialog", "MedQuAD"]:
+        evaluate_dataset(tag, run_pipeline, limit=5)

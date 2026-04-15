@@ -1,16 +1,4 @@
-"""
-MI-RAG: Knowledge Graph Construction
-Datasets : MTS-Dialog (CSV) + MedQuAD (XML folders)
-LLM      : openai/gpt-oss-120b via Groq (free tier)
-Features : Rate limit handling, delay between chunks, XML + CSV loaders
-"""
-
-import os
-import sys
-import time
-import pathlib
-import warnings
-import xml.etree.ElementTree as ET
+import os, sys, time, pathlib, warnings, xml.etree.ElementTree as ET
 import pandas as pd
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
@@ -22,200 +10,57 @@ from duckduckgo_search import DDGS
 warnings.filterwarnings("ignore")
 load_dotenv()
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-
 NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
 NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
 
-# Delay between chunks to avoid Groq rate limits (seconds)
-# Groq free tier = 30 req/min → 1 chunk uses ~3 LLM calls → safe at 6s delay
 DELAY_BETWEEN_CHUNKS = 6
 
 ALLOWED_RELATIONS = [
-    "can_treat_disease",
-    "may_suffer_from_disease",
-    "should_eat",
-    "common_medication_is",
-    "accompanied_by_symptoms_of",
-    "should_avoid_eating",
-    "symptoms_are",
-    "diagnostic_tests",
+    "can_treat_disease", "may_suffer_from_disease", "should_eat",
+    "common_medication_is", "accompanied_by_symptoms_of",
+    "should_avoid_eating", "symptoms_are", "diagnostic_tests",
 ]
 
-# ── LLM ────────────────────────────────────────────────────────────────────────
+# ── Model with fallback chain ──────────────────────────────────────────────────
+# Primary: llama-4-scout (30K TPM — best for big chunks)
+# Fallback: qwen3-32b (60 RPM), then llama-3.1-8b-instant (14.4K RPD)
+MODEL_CHAIN = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
+]
 
-llm = ChatGroq(
-    model="openai/gpt-oss-120b",
-    temperature=0,
-    api_key=os.getenv("GROQ_API_KEY"),
-)
+def make_llm(model: str):
+    return ChatGroq(model=model, temperature=0, api_key=os.getenv("GROQ_API_KEY"))
 
-# ── Neo4j ──────────────────────────────────────────────────────────────────────
-
-class KnowledgeGraph:
-    def __init__(self, uri, user, password):
-        self.driver = GraphDatabase.driver(uri, auth=(user, password))
-        self._create_indexes()
-
-    def close(self):
-        self.driver.close()
-
-    def _create_indexes(self):
-        with self.driver.session() as session:
-            session.run(
-                "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)"
-            )
-
-    def insert_triple(self, head: str, relation: str, tail: str):
-        relation_label = relation.upper().replace(" ", "_").replace("-", "_")
-        query = f"""
-        MERGE (h:Entity {{name: $head}})
-        MERGE (t:Entity {{name: $tail}})
-        MERGE (h)-[r:{relation_label}]->(t)
-        """
-        with self.driver.session() as session:
-            session.run(
-                query,
-                head=head.strip().lower(),
-                tail=tail.strip().lower(),
-            )
-
-    def get_stats(self) -> dict:
-        with self.driver.session() as session:
-            triples   = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
-            entities  = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
-            rel_types = [
-                r["t"] for r in
-                session.run("MATCH ()-[r]->() RETURN DISTINCT type(r) AS t").data()
-            ]
-        return {"triples": triples, "entities": entities, "relation_types": rel_types}
-
-# ── Loaders ────────────────────────────────────────────────────────────────────
-
-def load_mts_dialog(filepath: str, max_rows: int = None) -> list:
+def groq_invoke_with_retry(chain_fn, inputs: dict, max_wait: int = 300):
     """
-    MTS-Dialog CSV loader.
-    Combines section_text + dialogue columns into one chunk per row.
+    Retries forever (up to max_wait seconds total sleep) on ANY error.
+    Uses exponential backoff. Cycles through model fallbacks on rate limit.
     """
-    df = pd.read_csv(filepath, encoding="utf-8")
+    model_idx = 0
+    wait = 10  # start with 10s
 
-    for col in ["section_text", "dialogue"]:
-        if col not in df.columns:
-            raise ValueError(f"Column '{col}' not found. Got: {list(df.columns)}")
+    while True:
+        model = MODEL_CHAIN[model_idx % len(MODEL_CHAIN)]
+        try:
+            return chain_fn(model, inputs)
+        except Exception as e:
+            err = str(e).lower()
+            is_rate_limit = any(x in err for x in ["429", "rate limit", "too many", "quota"])
 
-    if max_rows:
-        df = df.head(max_rows)
+            if is_rate_limit:
+                print(f"  [rate limit] model={model} | sleeping {wait}s then trying next model...")
+                time.sleep(wait)
+                wait = min(wait * 2, 120)  # cap at 2 min
+                model_idx += 1             # rotate model
+            else:
+                print(f"  [error] {e} | sleeping {wait}s and retrying...")
+                time.sleep(wait)
+                wait = min(wait * 2, 120)
 
-    chunks = []
-    for _, row in df.iterrows():
-        section  = str(row["section_text"]).strip() if pd.notna(row["section_text"]) else ""
-        dialogue = str(row["dialogue"]).strip()     if pd.notna(row["dialogue"])     else ""
-        combined = " ".join(filter(None, [section, dialogue])).strip()
-        if combined:
-            chunks.append(combined)
-
-    print(f"  Loaded {len(chunks)} chunks from {filepath}")
-    return chunks
-
-
-def load_medquad_xml(filepath: str) -> list:
-    """
-    MedQuAD XML loader.
-    Extracts Question + Answer text from each QAPair and combines them.
-    Handles the structure:
-      <Document>
-        <QAPairs>
-          <QAPair>
-            <Question>...</Question>
-            <Answer>...</Answer>
-          </QAPair>
-        </QAPairs>
-      </Document>
-    """
-    chunks = []
-    try:
-        tree = ET.parse(filepath)
-        root = tree.getroot()
-
-        for qapair in root.findall(".//QAPair"):
-            question_el = qapair.find("Question")
-            answer_el   = qapair.find("Answer")
-
-            question = question_el.text.strip() if question_el is not None and question_el.text else ""
-            answer   = answer_el.text.strip()   if answer_el   is not None and answer_el.text   else ""
-
-            combined = " ".join(filter(None, [question, answer])).strip()
-            if combined:
-                chunks.append(combined)
-
-    except ET.ParseError as e:
-        print(f"  [XML ERROR] Could not parse {filepath}: {e}")
-
-    return chunks
-
-
-def load_medquad_folder(folder_path: str, max_files: int = None) -> list:
-    """
-    Loads all XML files from a MedQuAD folder (e.g. 1_CancerGov_QA).
-    Returns a flat list of all QA chunks across all files.
-    """
-    folder = pathlib.Path(folder_path)
-    xml_files = sorted(folder.glob("*.xml"))
-
-    if max_files:
-        xml_files = xml_files[:max_files]
-
-    print(f"  Found {len(xml_files)} XML files in {folder.name}")
-
-    all_chunks = []
-    for xml_file in xml_files:
-        chunks = load_medquad_xml(xml_file)
-        all_chunks.extend(chunks)
-
-    print(f"  Loaded {len(all_chunks)} chunks from {folder.name}")
-    return all_chunks
-
-
-def load_medquad_folders(root_path: str, folder_names: list, max_files_per_folder: int = None) -> list:
-    """
-    Loads multiple MedQuAD folders at once.
-    Pass folder_names=None to load ALL 12 folders.
-
-    Example:
-        load_medquad_folders("data/MedQuAD", ["1_CancerGov_QA", "4_MPlus_Health_Topics_QA"])
-    """
-    root = pathlib.Path(root_path)
-
-    if folder_names is None:
-        folders = [f for f in root.iterdir() if f.is_dir()]
-    else:
-        folders = [root / name for name in folder_names]
-
-    all_chunks = []
-    for folder in folders:
-        if folder.exists():
-            chunks = load_medquad_folder(str(folder), max_files=max_files_per_folder)
-            all_chunks.extend(chunks)
-        else:
-            print(f"  [WARN] Folder not found: {folder}")
-
-    print(f"\n  Total MedQuAD chunks loaded: {len(all_chunks)}")
-    return all_chunks
-
-# ── DuckDuckGo ─────────────────────────────────────────────────────────────────
-
-def search_term(term: str) -> str:
-    try:
-        with DDGS() as ddgs:
-            results = ddgs.text(f"{term} meaning medical field", max_results=2)
-            if results:
-                return results[0].get("body", "")
-    except Exception:
-        pass
-    return ""
-
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── LLM chain builders ─────────────────────────────────────────────────────────
 
 JARGON_DETECT_PROMPT = PromptTemplate.from_template("""
 Read the following medical text and list any abbreviations or domain-specific
@@ -228,7 +73,6 @@ Text: {text}
 JARGON_RESOLVE_PROMPT = PromptTemplate.from_template("""
 You are a medical expert.
 Search result context: {search_result}
-
 Explain what '{term}' means in the medical field in 1 sentence.
 If unknown, say: Unknown term.
 """)
@@ -256,30 +100,139 @@ Text:
 {text}
 """)
 
-jargon_detect_chain  = JARGON_DETECT_PROMPT     | llm | StrOutputParser()
-jargon_resolve_chain = JARGON_RESOLVE_PROMPT    | llm | StrOutputParser()
-triple_chain         = TRIPLE_EXTRACTION_PROMPT | llm | StrOutputParser()
+def _jargon_detect(model, inputs):
+    chain = JARGON_DETECT_PROMPT | make_llm(model) | StrOutputParser()
+    return chain.invoke(inputs)
+
+def _jargon_resolve(model, inputs):
+    chain = JARGON_RESOLVE_PROMPT | make_llm(model) | StrOutputParser()
+    return chain.invoke(inputs)
+
+def _triple_extract(model, inputs):
+    chain = TRIPLE_EXTRACTION_PROMPT | make_llm(model) | StrOutputParser()
+    return chain.invoke(inputs)
+
+# ── Neo4j ──────────────────────────────────────────────────────────────────────
+
+class KnowledgeGraph:
+    def __init__(self, uri, user, password):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+        self._create_indexes()
+
+    def close(self):
+        self.driver.close()
+
+    def _create_indexes(self):
+        with self.driver.session() as session:
+            session.run("CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)")
+
+    def insert_triple(self, head, relation, tail):
+        rel_label = relation.upper().replace(" ", "_").replace("-", "_")
+        query = f"""
+        MERGE (h:Entity {{name: $head}})
+        MERGE (t:Entity {{name: $tail}})
+        MERGE (h)-[r:{rel_label}]->(t)
+        """
+        with self.driver.session() as session:
+            session.run(query, head=head.strip().lower(), tail=tail.strip().lower())
+
+    def get_stats(self):
+        with self.driver.session() as session:
+            triples  = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+            entities = session.run("MATCH (e:Entity) RETURN count(e) AS c").single()["c"]
+            rel_types = [r["t"] for r in session.run("MATCH ()-[r]->() RETURN DISTINCT type(r) AS t").data()]
+        return {"triples": triples, "entities": entities, "relation_types": rel_types}
+
+    def get_questions_by_dataset(self, dataset_tag: str, limit: int = 20) -> list[str]:
+        """Pull questions stored with a dataset tag from the KG."""
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (q:Question {dataset: $tag})
+                RETURN q.text AS text
+                LIMIT $limit
+            """, tag=dataset_tag, limit=limit)
+            return [r["text"] for r in result]
+
+    def insert_question(self, question: str, dataset_tag: str):
+        """Store source question in KG for later eval retrieval."""
+        with self.driver.session() as session:
+            session.run("""
+                MERGE (q:Question {text: $text})
+                SET q.dataset = $tag
+            """, text=question.strip(), tag=dataset_tag)
+
+# ── Loaders ────────────────────────────────────────────────────────────────────
+
+def load_mts_dialog(filepath, max_rows=None):
+    df = pd.read_csv(filepath, encoding="utf-8")
+    if max_rows:
+        df = df.head(max_rows)
+    chunks, questions = [], []
+    for _, row in df.iterrows():
+        section  = str(row.get("section_text", "")).strip()
+        dialogue = str(row.get("dialogue", "")).strip()
+        combined = " ".join(filter(None, [section, dialogue])).strip()
+        if combined:
+            chunks.append(combined)
+            # First sentence of dialogue as question
+            q = dialogue.split(".")[0].strip()
+            if q:
+                questions.append(q)
+    print(f"  Loaded {len(chunks)} chunks from {filepath}")
+    return chunks, questions
+
+def load_medquad_xml(filepath):
+    chunks, questions = [], []
+    try:
+        tree = ET.parse(filepath)
+        root = tree.getroot()
+        for qapair in root.findall(".//QAPair"):
+            q_el = qapair.find("Question")
+            a_el = qapair.find("Answer")
+            question = q_el.text.strip() if q_el is not None and q_el.text else ""
+            answer   = a_el.text.strip()  if a_el is not None and a_el.text   else ""
+            combined = " ".join(filter(None, [question, answer])).strip()
+            if combined:
+                chunks.append(combined)
+            if question:
+                questions.append(question)
+    except ET.ParseError as e:
+        print(f"  [XML ERROR] {filepath}: {e}")
+    return chunks, questions
+
+def load_medquad_folders(root_path, folder_names, max_files_per_folder=None):
+    root = pathlib.Path(root_path)
+    folders = [root / name for name in folder_names] if folder_names else [f for f in root.iterdir() if f.is_dir()]
+    all_chunks, all_questions = [], []
+    for folder in folders:
+        if not folder.exists():
+            print(f"  [WARN] Not found: {folder}")
+            continue
+        xml_files = sorted(folder.glob("*.xml"))
+        if max_files_per_folder:
+            xml_files = xml_files[:max_files_per_folder]
+        for xml_file in xml_files:
+            c, q = load_medquad_xml(xml_file)
+            all_chunks.extend(c)
+            all_questions.extend(q)
+    print(f"  Total MedQuAD chunks: {len(all_chunks)}, questions: {len(all_questions)}")
+    return all_chunks, all_questions
+
+# ── DuckDuckGo ─────────────────────────────────────────────────────────────────
+
+def search_term(term):
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(f"{term} meaning medical field", max_results=2)
+            if results:
+                return results[0].get("body", "")
+    except Exception:
+        pass
+    return ""
 
 # ── Processing ─────────────────────────────────────────────────────────────────
 
-def extract_jargon(text: str) -> list:
-    result = jargon_detect_chain.invoke({"text": text})
-    if result.strip().upper() == "NONE":
-        return []
-    return [t.strip() for t in result.split(",") if t.strip()]
-
-def resolve_jargon(terms: list) -> dict:
-    resolved = {}
-    for term in terms:
-        explanation = jargon_resolve_chain.invoke({
-            "term": term,
-            "search_result": search_term(term),
-        })
-        resolved[term] = explanation.strip()
-        print(f"    [jargon] {term} → {explanation[:70]}...")
-    return resolved
-
-def parse_triples(raw: str) -> list:
+def parse_triples(raw):
     triples = []
     for line in raw.strip().splitlines():
         parts = [p.strip() for p in line.split("|")]
@@ -290,18 +243,24 @@ def parse_triples(raw: str) -> list:
                 triples.append((head, rel_clean, tail))
     return triples
 
-def process_chunk(text: str, kg: KnowledgeGraph) -> int:
-    # Truncate very long chunks to avoid token limits
+def process_chunk(text, kg):
     text = text[:2000]
 
-    jargon_terms = extract_jargon(text)
-    if jargon_terms:
-        print(f"  Jargon: {jargon_terms}")
+    raw_jargon = groq_invoke_with_retry(_jargon_detect, {"text": text})
+    jargon_terms = [] if raw_jargon.strip().upper() == "NONE" else [t.strip() for t in raw_jargon.split(",") if t.strip()]
 
-    resolved     = resolve_jargon(jargon_terms) if jargon_terms else {}
+    resolved = {}
+    for term in jargon_terms:
+        explanation = groq_invoke_with_retry(_jargon_resolve, {
+            "term": term,
+            "search_result": search_term(term),
+        })
+        resolved[term] = explanation.strip()
+        print(f"    [jargon] {term} → {explanation[:70]}...")
+
     resolved_str = "\n".join(f"- {k}: {v}" for k, v in resolved.items()) or "None"
 
-    raw = triple_chain.invoke({
+    raw = groq_invoke_with_retry(_triple_extract, {
         "text": text,
         "allowed_relations": "\n".join(f"- {r}" for r in ALLOWED_RELATIONS),
         "resolved_jargon": resolved_str,
@@ -309,21 +268,19 @@ def process_chunk(text: str, kg: KnowledgeGraph) -> int:
 
     triples = parse_triples(raw)
     print(f"  {len(triples)} triples extracted")
-
     for head, rel, tail in triples:
         kg.insert_triple(head, rel, tail)
         print(f"    + ({head}) -[{rel}]-> ({tail})")
 
     return len(triples)
 
+def run_dataset(name, chunks, questions, kg, dataset_tag, delay=DELAY_BETWEEN_CHUNKS):
+    print(f"\n{'='*60}\nDataset : {name} | Chunks: {len(chunks)}\n{'='*60}")
 
-def run_dataset(name: str, chunks: list, kg: KnowledgeGraph, delay: float = DELAY_BETWEEN_CHUNKS):
-    """Process a list of chunks into the KG with rate limit delay."""
-    print(f"\n{'='*60}")
-    print(f"Dataset : {name}")
-    print(f"Chunks  : {len(chunks)}")
-    print(f"Delay   : {delay}s between chunks")
-    print(f"{'='*60}")
+    # Store questions in KG for eval retrieval
+    for q in questions[:50]:  # store up to 50 per dataset
+        kg.insert_question(q, dataset_tag)
+    print(f"  Stored {min(len(questions),50)} questions with tag='{dataset_tag}'")
 
     total = 0
     for i, chunk in enumerate(chunks):
@@ -331,9 +288,7 @@ def run_dataset(name: str, chunks: list, kg: KnowledgeGraph, delay: float = DELA
         try:
             total += process_chunk(chunk, kg)
         except Exception as e:
-            print(f"  [ERROR] Skipping chunk: {e}")
-
-        # Rate limit guard — sleep between chunks
+            print(f"  [FATAL] {e}")
         if i < len(chunks) - 1:
             time.sleep(delay)
 
@@ -343,47 +298,24 @@ def run_dataset(name: str, chunks: list, kg: KnowledgeGraph, delay: float = DELA
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-
     print(f"Connecting to Neo4j at {NEO4J_URI}...")
     kg = KnowledgeGraph(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
     print("Connected.\n")
 
     grand_total = 0
 
-    # ── DATASET 1: MTS-Dialog CSV ─────────────────────────────────────────────
-    # Remove max_rows once you're confident the pipeline works
     print("\nLoading MTS-Dialog...")
-    mts_chunks = load_mts_dialog(
-        "data/MTS-Dialog-TrainingSet.csv",
-        max_rows=None,       # ← set to e.g. 50 for quick test, None for full
-    )
-    grand_total += run_dataset("MTS-Dialog", mts_chunks, kg)
+    mts_chunks, mts_questions = load_mts_dialog("data/MTS-Dialog-TrainingSet.csv", max_rows=None)
+    grand_total += run_dataset("MTS-Dialog", mts_chunks, mts_questions, kg, dataset_tag="MTS-Dialog")
 
-    # ── DATASET 2: MedQuAD XML ────────────────────────────────────────────────
-    # Recommended: start with 3 folders. Add more once you're happy with results.
-    # Available folders:
-    #   1_CancerGov_QA, 2_GARD_QA, 3_GHR_QA, 4_MPlus_Health_Topics_QA,
-    #   5_NIDDK_QA, 6_NINDS_QA, 7_SeniorHealth_QA, 8_NHLBI_QA_XML,
-    #   9_CDC_QA, 10_MPlus_ADAM_QA, 11_MPlusDrugs_QA, 12_MPlusHerbsSupplements_QA
     print("\nLoading MedQuAD...")
-    medquad_chunks = load_medquad_folders(
+    mq_chunks, mq_questions = load_medquad_folders(
         root_path="data/MedQuAD",
-        folder_names=[
-            "1_CancerGov_QA",
-            "4_MPlus_Health_Topics_QA",
-            "9_CDC_QA",
-        ],
-        max_files_per_folder=20,  # ← remove or increase once tested
+        folder_names=["1_CancerGov_QA", "4_MPlus_Health_Topics_QA", "9_CDC_QA"],
+        max_files_per_folder=20,
     )
-    grand_total += run_dataset("MedQuAD", medquad_chunks, kg)
+    grand_total += run_dataset("MedQuAD", mq_chunks, mq_questions, kg, dataset_tag="MedQuAD")
 
-    # ── Final stats ───────────────────────────────────────────────────────────
     stats = kg.get_stats()
-    print(f"\n{'='*60}")
-    print(f"FINAL STATS")
-    print(f"  Total triples   : {stats['triples']}")
-    print(f"  Total entities  : {stats['entities']}")
-    print(f"  Relation types  : {stats['relation_types']}")
-    print(f"{'='*60}")
-
+    print(f"\n{'='*60}\nFINAL STATS\n  Triples  : {stats['triples']}\n  Entities : {stats['entities']}\n  Rel types: {stats['relation_types']}\n{'='*60}")
     kg.close()
