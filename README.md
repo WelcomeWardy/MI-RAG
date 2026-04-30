@@ -406,7 +406,3 @@ It should not be used as a substitute for professional medical diagnosis or trea
 # Contributors
 
 Built as a research-oriented medical RAG pipeline focused on explainable retrieval and hallucination-aware answer generation.
-
----
-MIT License
-```
